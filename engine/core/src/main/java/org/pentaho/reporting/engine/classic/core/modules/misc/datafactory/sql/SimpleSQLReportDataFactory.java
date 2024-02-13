@@ -27,6 +27,9 @@ import org.pentaho.reporting.engine.classic.core.ReportDataFactoryException;
 import org.pentaho.reporting.engine.classic.core.ReportDataFactoryQueryTimeoutException;
 import org.pentaho.reporting.libraries.base.config.Configuration;
 import org.pentaho.reporting.libraries.base.util.ObjectUtilities;
+import org.pentaho.reporting.platform.plugin.async.AsyncReportStatusListener;
+import org.pentaho.reporting.platform.plugin.async.IAsyncReportListener;
+import org.pentaho.reporting.platform.plugin.async.ReportListenerThreadHolder;
 
 import javax.swing.table.TableModel;
 import java.sql.CallableStatement;
@@ -35,6 +38,7 @@ import java.sql.ParameterMetaData;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.SQLFeatureNotSupportedException;
 import java.sql.SQLTimeoutException;
 import java.sql.Statement;
 import java.sql.Timestamp;
@@ -43,6 +47,9 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Date;
 import java.util.LinkedHashSet;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
 
 
 /**
@@ -338,7 +345,8 @@ public class SimpleSQLReportDataFactory extends AbstractDataFactory {
     return ResultSetTableModelFactory.getInstance().createTableModel( res, columnNameMapping, true );
   }
 
-  public ResultSet performQuery( Statement statement, final String translatedQuery, final String[] preparedParameterNames )
+  // [PIR-1513] this code was commented out so ENG can see the original method
+  public ResultSet performQuery_original( Statement statement, final String translatedQuery, final String[] preparedParameterNames )
     throws SQLException {
     final ResultSet res;
     if ( preparedParameterNames.length == 0 ) {
@@ -349,6 +357,92 @@ public class SimpleSQLReportDataFactory extends AbstractDataFactory {
     }
     return res;
   }
+  
+  
+  // [PIR-1513] New "performQuery" code that uses a callable to run the query to be able to monitor Thread interruption or catch the reports status Listener cancelled status
+  public ResultSet performQuery( Statement statement, final String translatedQuery, final String[] preparedParameterNames )
+		    throws SQLException {
+	  
+	  logger.debug("This ThreadID " + Thread.currentThread().getName());
+	  
+	  Callable<ResultSet> callable = () -> {
+		  ResultSet res;
+    	    if ( preparedParameterNames.length == 0 ) {
+    	    	res = statement.executeQuery( translatedQuery );
+    	    } else {
+    	      final PreparedStatement pstmt = (PreparedStatement) statement;
+    	      res = pstmt.executeQuery();
+    	    }
+			return res;
+      };
+
+      FutureTask<ResultSet> futureTask = new FutureTask<>(callable);
+      Thread thread = new Thread(futureTask);
+      thread.start();
+      
+      //Lets connect to the listener to detect if it is cancelled by the user
+      //Normlaly we want to use the "Interface" and not the underalying object, but If I chabge the interface, this needs a full Reporting and PIR project re-build
+      //which this change, I know this works for HotFix delivery
+      AsyncReportStatusListener reporytListerner = null;
+	  if (ReportListenerThreadHolder.getListener() != null && ReportListenerThreadHolder.getListener() instanceof AsyncReportStatusListener) {
+		  reporytListerner=(AsyncReportStatusListener) ReportListenerThreadHolder.getListener();
+	  }      
+      
+      long sleepingTime=1;
+      while (!futureTask.isDone()) {         
+          if  ((reporytListerner!=null && reporytListerner.isCanceled()) || (Thread.currentThread().isInterrupted())) {
+        	  logger.warn("An interruption was captured, managing the waterfall cancelation process");
+              // Try to send CANCELATION to the underlying query
+              tryCancelStatement(statement);     	  
+          }
+          
+          try {
+              Thread.sleep(sleepingTime);
+          } catch (InterruptedException e) {
+              // Restore the interrupted status
+              Thread.currentThread().interrupt();
+          }
+          //this increases the sleep time to avoid waiting for more time than required
+          if (sleepingTime<=20)
+        	  sleepingTime++;
+          logger.trace("Runnig query ...");
+      }
+      
+  	  
+      try {
+    	  return futureTask.get();
+      } catch (InterruptedException e) {
+    	  logger.warn("An interruption was captured, managing the waterfall cancelation process");
+          // Try to send CANCELATION to the underlying query
+          tryCancelStatement(statement);
+          // Restore the interrupted status
+          Thread.currentThread().interrupt();
+      } catch (ExecutionException e) {
+    	    Throwable cause = e.getCause();
+    	    if (cause instanceof SQLException) {
+    	        throw (SQLException) cause;
+    	    }
+	}
+      
+    return null;
+  }
+
+  //[PIR-1513] New code that is called to TRY to cancel que underlaying SQL statement. 
+  private void tryCancelStatement(Statement statement) throws SQLException {
+	  try {
+		    if (statement != null) {
+		    	logger.warn("Sending CANCEL to underlaying SQL Statament");
+		        statement.cancel();
+		    }
+		} catch (SQLFeatureNotSupportedException e) {
+		    logger.error("Unable to cancel the underlaying SQL Statament, this Driver does not support cancel feature");
+		    throw e;
+		} catch (SQLException e) {
+		    logger.error("Unable to cancel the underlaying SQL Statament");
+		    throw e;
+		}
+  }
+    
 
   private void parametrize( final DataRow parameters, final String[] params, final PreparedStatement pstmt,
       final boolean expandArrays, final int parameterOffset ) throws SQLException {
